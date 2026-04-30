@@ -1,0 +1,53 @@
+# Joby self-hosted overrides for the mem0 dev stack.
+# Auto-merged by `docker compose up` because of the file name.
+#
+# What this adds on top of upstream `docker-compose.yaml`:
+#   - `restart: unless-stopped` on every service so the stack auto-starts after
+#     host reboots (Docker daemon brings them back without a manual `up`)
+#   - An `ollama` sidecar with NVIDIA GPU passthrough, used as the embedder
+#     by the mem0 server when MEM0_DEFAULT_EMBEDDER_PROVIDER=ollama
+#   - On the mem0 service: depends_on the new `ollama` service, OLLAMA_HOST
+#     pointing at the sidecar, and a read-only mount of ~/.aws so boto3 can
+#     pick up the host's SSO token cache for AWS Bedrock (LLM provider)
+#
+# To opt out of any of this, delete or comment the relevant block — compose
+# will then use only the base file's definitions.
+
+services:
+  mem0:
+    restart: unless-stopped
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+
+  postgres:
+    restart: unless-stopped
+
+  mem0-dashboard:
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    networks:
+      - mem0_network
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
