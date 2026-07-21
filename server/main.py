@@ -461,16 +461,26 @@ def get_all_memories(
     user_id: Optional[str] = None,
     run_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    author: Optional[str] = None,
+    limit: int = 100,
     _auth=Depends(verify_auth),
 ):
-    """Retrieve stored memories. Lists all memories when no identifier is provided."""
+    """Retrieve stored memories. Lists all memories when no identifier is provided.
+
+    `limit` caps the results (pgvector `top_k`; default 100). `author` — and any
+    other metadata — is applied server-side as a payload filter, so a minority
+    author isn't silently lost behind a small page of a large shared pool
+    (the previous top_k=20 default returned wrong/empty results for such filters).
+    """
     try:
         if not any([user_id, run_id, agent_id]):
-            return _list_all_memories()
+            return _list_all_memories(limit=limit)
         filters = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
         }
-        return get_memory_instance().get_all(filters=filters)
+        if author is not None:
+            filters["author"] = author
+        return get_memory_instance().get_all(filters=filters, top_k=limit)
     except Exception:
         raise upstream_error()
 
