@@ -1,0 +1,21 @@
+# Never bake local-dev secrets into the image. The cluster gets config via
+# K8s ConfigMap + Secret, and AWS auth via IRSA — none of which need .env.
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts written by the dev stack
+history/
+
+# Python noise
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editor / VCS
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store

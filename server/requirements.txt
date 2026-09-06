@@ -3,13 +3,18 @@ uvicorn==0.34.0
 pydantic[email]==2.10.4
 mem0ai>=0.1.48
 python-dotenv==1.0.1
-psycopg>=3.2.8
+# Use the [binary] extra so the image ships with the precompiled C wrapper.
+# Without this, python:3.12-slim (which has no libpq) fails at runtime with:
+#   ImportError: no pq wrapper available.
+psycopg[binary]>=3.2.8
 psycopg-pool>=3.2.6,<4.0.0
 
 # Bundled LLM/embedder providers. Extend by adding the provider's package
 # here, rebuilding the image, and updating BUNDLED_*_PROVIDERS in main.py.
 anthropic>=0.39,<1.0
 google-generativeai>=0.8,<1.0
+ollama>=0.4,<1.0
+boto3>=1.35,<2.0
 
 # Auth & database (Phase 1)
 sqlalchemy>=2.0,<3.0

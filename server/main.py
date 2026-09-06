@@ -52,8 +52,8 @@ SENSITIVE_CONFIG_KEYS = {
 SKIPPED_REQUEST_LOG_PATHS = {"/api/health", "/docs", "/redoc", "/openapi.json"}
 SKIPPED_REQUEST_LOG_PREFIXES = ("/requests",)
 
-BUNDLED_LLM_PROVIDERS = ("openai", "anthropic", "gemini")
-BUNDLED_EMBEDDER_PROVIDERS = ("openai", "gemini")
+BUNDLED_LLM_PROVIDERS = ("openai", "anthropic", "gemini", "aws_bedrock")
+BUNDLED_EMBEDDER_PROVIDERS = ("openai", "gemini", "ollama")
 
 
 def _warn_if_unconfigured() -> None:
@@ -106,9 +106,83 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+
+DEFAULT_LLM_PROVIDER = os.environ.get("MEM0_DEFAULT_LLM_PROVIDER", "openai")
+DEFAULT_EMBEDDER_PROVIDER = os.environ.get("MEM0_DEFAULT_EMBEDDER_PROVIDER", "openai")
 DEFAULT_LLM_MODEL = os.environ.get("MEM0_DEFAULT_LLM_MODEL", "gpt-4.1-nano-2025-04-14")
 DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-embedding-3-small")
+DEFAULT_EMBEDDING_DIMS = int(os.environ.get("MEM0_DEFAULT_EMBEDDING_DIMS", "1536"))
+
+
+def _llm_default_config():
+    if DEFAULT_LLM_PROVIDER == "anthropic":
+        return {
+            "provider": "anthropic",
+            "config": {
+                "api_key": ANTHROPIC_API_KEY,
+                "temperature": 0.2,
+                "model": DEFAULT_LLM_MODEL,
+            },
+        }
+    if DEFAULT_LLM_PROVIDER == "aws_bedrock":
+        # NB: don't pass aws_profile — mem0's bedrock impl forwards it as
+        # `profile_name` to boto3.client() which doesn't accept that arg
+        # (only Session() does). boto3 reads AWS_PROFILE from env on its own.
+        return {
+            "provider": "aws_bedrock",
+            "config": {
+                "model": DEFAULT_LLM_MODEL,
+                "temperature": 0.2,
+                "aws_region": os.environ.get("AWS_REGION", "us-west-2"),
+            },
+        }
+    if DEFAULT_LLM_PROVIDER == "gemini":
+        return {
+            "provider": "gemini",
+            "config": {
+                "api_key": GOOGLE_API_KEY,
+                "temperature": 0.2,
+                "model": DEFAULT_LLM_MODEL,
+            },
+        }
+    return {
+        "provider": "openai",
+        "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
+    }
+
+
+def _embedder_default_config():
+    if DEFAULT_EMBEDDER_PROVIDER == "ollama":
+        return {
+            "provider": "ollama",
+            "config": {
+                "ollama_base_url": OLLAMA_HOST,
+                "model": DEFAULT_EMBEDDER_MODEL,
+                "embedding_dims": DEFAULT_EMBEDDING_DIMS,
+            },
+        }
+    if DEFAULT_EMBEDDER_PROVIDER == "gemini":
+        return {
+            "provider": "gemini",
+            "config": {
+                "api_key": GOOGLE_API_KEY,
+                "model": DEFAULT_EMBEDDER_MODEL,
+                "embedding_dims": DEFAULT_EMBEDDING_DIMS,
+            },
+        }
+    return {
+        "provider": "openai",
+        "config": {
+            "api_key": OPENAI_API_KEY,
+            "model": DEFAULT_EMBEDDER_MODEL,
+            "embedding_dims": DEFAULT_EMBEDDING_DIMS,
+        },
+    }
+
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -121,13 +195,11 @@ DEFAULT_CONFIG = {
             "user": POSTGRES_USER,
             "password": POSTGRES_PASSWORD,
             "collection_name": POSTGRES_COLLECTION_NAME,
+            "embedding_model_dims": DEFAULT_EMBEDDING_DIMS,
         },
     },
-    "llm": {
-        "provider": "openai",
-        "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
-    },
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL}},
+    "llm": _llm_default_config(),
+    "embedder": _embedder_default_config(),
     "history_db_path": HISTORY_DB_PATH,
 }
 
@@ -389,16 +461,26 @@ def get_all_memories(
     user_id: Optional[str] = None,
     run_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    author: Optional[str] = None,
+    limit: int = 100,
     _auth=Depends(verify_auth),
 ):
-    """Retrieve stored memories. Lists all memories when no identifier is provided."""
+    """Retrieve stored memories. Lists all memories when no identifier is provided.
+
+    `limit` caps the results (pgvector `top_k`; default 100). `author` — and any
+    other metadata — is applied server-side as a payload filter, so a minority
+    author isn't silently lost behind a small page of a large shared pool
+    (the previous top_k=20 default returned wrong/empty results for such filters).
+    """
     try:
         if not any([user_id, run_id, agent_id]):
-            return _list_all_memories()
+            return _list_all_memories(limit=limit)
         filters = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
         }
-        return get_memory_instance().get_all(filters=filters)
+        if author is not None:
+            filters["author"] = author
+        return get_memory_instance().get_all(filters=filters, top_k=limit)
     except Exception:
         raise upstream_error()
 
@@ -416,7 +498,18 @@ def get_memory(memory_id: str, _auth=Depends(verify_auth)):
 def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
     """Search for memories based on a query."""
     try:
-        params = {k: v for k, v in search_req.model_dump().items() if v is not None and k != "query"}
+        # mem0's Memory.search() rejects user_id/agent_id/run_id at the top
+        # level — they belong inside filters={...}. Translate here so the
+        # request schema (which accepts them at the top level) keeps working.
+        dump = search_req.model_dump()
+        filters = dict(dump.get("filters") or {})
+        for entity_key in ("user_id", "agent_id", "run_id"):
+            val = dump.pop(entity_key, None)
+            if val is not None and entity_key not in filters:
+                filters[entity_key] = val
+        params = {k: v for k, v in dump.items() if v is not None and k != "query"}
+        if filters:
+            params["filters"] = filters
         return get_memory_instance().search(query=search_req.query, **params)
     except Exception:
         raise upstream_error()
